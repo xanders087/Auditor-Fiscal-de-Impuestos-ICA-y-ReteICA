@@ -1,7 +1,5 @@
 export type TaxType = "ICA" | "RETEICA" | "DESCONOCIDO";
 
-export type ExtractionPipeline = "hybrid_markdown_ocr" | "direct_multimodal";
-
 export interface TaxEntry {
   id: string;
   fileName: string;
@@ -28,7 +26,6 @@ export interface TaxEntry {
 export interface Configuration {
   provider: "gemini";
   model: "gemini-3.1-flash-lite" | "gemini-2.5-flash" | "gemini-3.5-flash";
-  pipeline: ExtractionPipeline;
   apiKey?: string;
 }
 

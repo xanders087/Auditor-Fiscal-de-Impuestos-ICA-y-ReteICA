@@ -13,7 +13,7 @@ import {
   Search,
   RotateCcw,
 } from "lucide-react";
-import { TaxEntry, Configuration, FileItem, ExtractionPipeline } from "./types";
+import { TaxEntry, Configuration, FileItem } from "./types";
 import { exportToExcel } from "./utils/excelExport";
 import JSZip from "jszip";
 
@@ -27,12 +27,31 @@ export function formatColombianPesos(val: number): string {
   }).format(val);
 }
 
-interface QuotaTrackerState {
+// Contador local de peticiones enviadas hoy, por modelo. Es solo informativo:
+// la cuota real la define Google por proyecto y se consulta en el panel de AI Studio.
+interface RequestCounterState {
   date: string; // YYYY-MM-DD
-  dailyRequests: number;
-  dailyLimit: number;
-  rpmSafeLimit: number;
+  counts: Record<string, number>;
 }
+
+type ApiStatusKind = "idle" | "ok" | "rate_minute" | "overloaded" | "quota_daily" | "other";
+
+// Último resultado real devuelto por la API de Gemini
+interface ApiStatus {
+  kind: ApiStatusKind;
+  model?: string;
+  keySource?: "custom" | "aistudio";
+  httpStatus?: number | null;
+  message?: string;
+}
+
+interface WaitState {
+  seconds: number;
+  reason: "pacing" | "rate_minute" | "overloaded";
+}
+
+const PACING_SECONDS = 12;
+const MAX_RETRIES_PER_FILE = 3;
 
 function getTodayDateString(): string {
   const now = new Date();
@@ -58,7 +77,6 @@ export default function App() {
         return {
           provider: "gemini",
           model: resolvedModel,
-          pipeline: parsed.pipeline === "direct_multimodal" ? "direct_multimodal" : "hybrid_markdown_ocr",
           apiKey: parsed.apiKey || "",
         };
       } catch {
@@ -68,41 +86,29 @@ export default function App() {
     return {
       provider: "gemini",
       model: "gemini-3.1-flash-lite",
-      pipeline: "hybrid_markdown_ocr",
       apiKey: "",
     };
   });
 
-  // Quota & Rate-Limit tracking state
-  const [quotaTracker, setQuotaTracker] = useState<QuotaTrackerState>(() => {
+  const [requestCounter, setRequestCounter] = useState<RequestCounterState>(() => {
     const today = getTodayDateString();
-    const saved = localStorage.getItem("tax_audits_quota_tracker");
+    const saved = localStorage.getItem("tax_audits_request_counter");
     if (saved) {
       try {
         const parsed = JSON.parse(saved);
-        if (parsed.date === today && typeof parsed.dailyRequests === "number") {
-          return {
-            date: today,
-            dailyRequests: parsed.dailyRequests,
-            dailyLimit: parsed.dailyLimit || 500,
-            rpmSafeLimit: parsed.rpmSafeLimit || 5,
-          };
+        if (parsed.date === today && parsed.counts && typeof parsed.counts === "object") {
+          return { date: today, counts: parsed.counts };
         }
       } catch {
         // Ignore parse error
       }
     }
-    return {
-      date: today,
-      dailyRequests: 0,
-      dailyLimit: 500,
-      rpmSafeLimit: 5,
-    };
+    return { date: today, counts: {} };
   });
 
-  // Sliding 60-second window of request timestamps (ms) for real-time RPM calculation
-  const [recentRequestTimestamps, setRecentRequestTimestamps] = useState<number[]>([]);
-  const [hadRecentRateLimitWait, setHadRecentRateLimitWait] = useState(false);
+  const [apiStatus, setApiStatus] = useState<ApiStatus>({ kind: "idle" });
+  const [waitState, setWaitState] = useState<WaitState | null>(null);
+  const [showApiKey, setShowApiKey] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<"ALL" | "ICA" | "RETEICA">("ALL");
@@ -112,7 +118,6 @@ export default function App() {
   const [isCancelling, setIsCancelling] = useState(false);
   const cancelBatchRef = useRef(false);
   const [batchProgress, setBatchProgress] = useState(0);
-  const [cooldownRemaining, setCooldownRemaining] = useState<number>(0);
   const [showConfig, setShowConfig] = useState(false);
   const [noticeBanner, setNoticeBanner] = useState<string | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
@@ -130,66 +135,42 @@ export default function App() {
     localStorage.setItem("tax_audits_config", JSON.stringify(config));
   }, [config]);
 
-  // Save quota tracker to localStorage
+  // Save request counter to localStorage
   useEffect(() => {
-    localStorage.setItem("tax_audits_quota_tracker", JSON.stringify(quotaTracker));
-  }, [quotaTracker]);
+    localStorage.setItem("tax_audits_request_counter", JSON.stringify(requestCounter));
+  }, [requestCounter]);
 
-  // Prune sliding 60s RPM window every second
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const cutoff = Date.now() - 60000;
-      setRecentRequestTimestamps((prev) => {
-        const filtered = prev.filter((ts) => ts > cutoff);
-        if (filtered.length === 0) {
-          setHadRecentRateLimitWait(false);
-        }
-        return filtered.length !== prev.length ? filtered : prev;
-      });
-    }, 1000);
-    return () => clearInterval(interval);
-  }, []);
+  // Count requests actually sent to Gemini today, per model
+  const recordApiRequests = (model: string, count: number) => {
+    if (count <= 0) return;
+    const today = getTodayDateString();
+    setRequestCounter((prev) => {
+      const counts = prev.date === today ? prev.counts : {};
+      return { date: today, counts: { ...counts, [model]: (counts[model] || 0) + count } };
+    });
+  };
 
-  // Helper to record API requests in both sliding 60s RPM window and daily counter
-  const recordApiRequests = (count: number, hadRateWait = false) => {
-    const now = Date.now();
-    const newStamps = Array.from({ length: Math.max(1, count) }, () => now);
-    setRecentRequestTimestamps((prev) => [...prev.filter((ts) => ts > now - 60000), ...newStamps]);
-    if (hadRateWait) {
-      setHadRecentRateLimitWait(true);
+  const resetRequestCounter = () => {
+    setRequestCounter({ date: getTodayDateString(), counts: {} });
+  };
+
+  const requestsTodayForModel =
+    requestCounter.date === getTodayDateString() ? requestCounter.counts[config.model] || 0 : 0;
+  const hasCustomKey = Boolean(config.apiKey && config.apiKey.trim());
+
+  // Visible countdown; returns false if the batch was cancelled while waiting
+  const waitWithCountdown = async (seconds: number, reason: WaitState["reason"]): Promise<boolean> => {
+    let remaining = Math.max(1, Math.ceil(seconds));
+    setWaitState({ seconds: remaining, reason });
+    while (remaining > 0) {
+      if (cancelBatchRef.current) break;
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      remaining--;
+      if (remaining > 0) setWaitState({ seconds: remaining, reason });
     }
-    const today = getTodayDateString();
-    setQuotaTracker((prev) => ({
-      ...prev,
-      date: today,
-      dailyRequests: (prev.date === today ? prev.dailyRequests : 0) + Math.max(1, count),
-    }));
+    setWaitState(null);
+    return !cancelBatchRef.current;
   };
-
-  const resetQuotaCounter = () => {
-    const today = getTodayDateString();
-    setQuotaTracker((prev) => ({
-      ...prev,
-      date: today,
-      dailyRequests: 0,
-    }));
-    setRecentRequestTimestamps([]);
-    setHadRecentRateLimitWait(false);
-  };
-
-  // Compute live rate-limit metrics and visual status
-  const currentRpm = recentRequestTimestamps.length;
-  const rpmRatio = currentRpm / quotaTracker.rpmSafeLimit;
-  const dailyRatio = quotaTracker.dailyRequests / quotaTracker.dailyLimit;
-
-  const rateStatus: "optimal" | "near_limit" | "at_limit" =
-    hadRecentRateLimitWait || currentRpm >= quotaTracker.rpmSafeLimit || dailyRatio >= 0.9
-      ? "at_limit"
-      : currentRpm >= Math.ceil(quotaTracker.rpmSafeLimit * 0.6) ||
-        cooldownRemaining > 0 ||
-        dailyRatio >= 0.75
-      ? "near_limit"
-      : "optimal";
 
   // Handle Drag Over events
   const handleDrag = (e: React.DragEvent) => {
@@ -315,171 +296,177 @@ export default function App() {
   const runBatchProcessing = async () => {
     if (fileQueue.length === 0 || isProcessingBatch) return;
 
+    const pendingFiles = fileQueue.filter((item) => item.status === "pending" || item.status === "error");
+    if (pendingFiles.length === 0) return;
+
     setIsProcessingBatch(true);
     setIsCancelling(false);
     cancelBatchRef.current = false;
     setBatchProgress(0);
 
-    const pendingFiles = fileQueue.filter((item) => item.status === "pending" || item.status === "error");
-    if (pendingFiles.length === 0) {
-      setIsProcessingBatch(false);
-      return;
-    }
-
     const totalToProcess = pendingFiles.length;
     let completedCount = 0;
+    let dailyQuotaHit = false;
+
+    const setItem = (id: string, patch: Partial<FileItem>) =>
+      setFileQueue((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)));
 
     for (let i = 0; i < pendingFiles.length; i++) {
-      if (cancelBatchRef.current) {
-        break;
-      }
+      if (cancelBatchRef.current) break;
 
       const fileItem = pendingFiles[i];
 
-      // Space consecutive requests to respect Free Tier rate limit
-      if (i > 0) {
-        let seconds = 12;
-        setCooldownRemaining(seconds);
+      // Preventive spacing between documents (about 5 requests per minute)
+      if (i > 0 && !(await waitWithCountdown(PACING_SECONDS, "pacing"))) break;
 
-        while (seconds > 0) {
-          if (cancelBatchRef.current) {
-            break;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          seconds--;
-          setCooldownRemaining(seconds);
-        }
-      }
+      setItem(fileItem.id, { status: "processing", progress: 30, stageLabel: "Leyendo con Gemini", errorMsg: undefined });
 
-      if (cancelBatchRef.current) {
-        break;
-      }
-
-      // Stage 1 status update
-      setFileQueue((prev) =>
-        prev.map((item) =>
-          item.id === fileItem.id
-            ? {
-                ...item,
-                status: "processing",
-                progress: 30,
-                stageLabel:
-                  config.pipeline === "hybrid_markdown_ocr"
-                    ? "OCR + Auditoría"
-                    : "Extracción Directa",
-              }
-            : item
-        )
-      );
+      let finished = false;
+      let retries = 0;
 
       try {
-        if (cancelBatchRef.current) break;
-
         const pdfBase64 = await fileToBase64(fileItem.file);
 
-        if (cancelBatchRef.current) break;
+        while (!finished && !cancelBatchRef.current) {
+          setItem(fileItem.id, { progress: 65, stageLabel: "Leyendo con Gemini" });
 
-        setFileQueue((prev) =>
-          prev.map((item) => (item.id === fileItem.id ? { ...item, progress: 65 } : item))
-        );
+          const response = await fetch("/api/process-form", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              pdfBase64: pdfBase64,
+              fileName: fileItem.file.name,
+              customApiKey: config.apiKey?.trim() || undefined,
+              model: config.model,
+            }),
+          });
 
-        const response = await fetch("/api/process-form", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            pdfBase64: pdfBase64,
-            fileName: fileItem.file.name,
-            customApiKey: config.apiKey || undefined,
-            model: config.model,
-            pipeline: config.pipeline,
-          }),
-        });
+          let result: any;
+          const responseText = await response.text();
+          try {
+            result = JSON.parse(responseText);
+          } catch {
+            throw new Error(`Error de red o timeout del servidor (Código: ${response.status}). Intente de nuevo.`);
+          }
 
-        if (cancelBatchRef.current) break;
+          const modelUsed: string = result.model || config.model;
+          recordApiRequests(modelUsed, typeof result.apiCalls === "number" ? result.apiCalls : 1);
 
-        let result;
-        const responseText = await response.text();
-        try {
-          result = JSON.parse(responseText);
-        } catch {
-          recordApiRequests(1, false);
-          throw new Error(`Error de red o timeout del servidor (Código: ${response.status}). Intente de nuevo.`);
-        }
+          if (cancelBatchRef.current) break;
 
-        // Update quota counter with actual requests reported by server (including any automatic retries)
-        const serverRequestsUsed = result?.quotaMetrics?.requestsUsed ?? 1;
-        const serverHadWait = Boolean(result?.quotaMetrics?.hadRateLimitWait);
-        recordApiRequests(serverRequestsUsed, serverHadWait);
+          if (result.success) {
+            const extracted = result.data;
 
-        if (cancelBatchRef.current) break;
+            const newEntry: TaxEntry = {
+              id: `audit-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+              fileName: fileItem.name,
+              municipio: extracted.municipio || "Desconocido",
+              tipo_impuesto: (extracted.tipo_impuesto || "DESCONOCIDO").toUpperCase() as any,
+              nit: extracted.nit || "M-N/A",
+              contribuyente: extracted.contribuyente || "Desconocido",
+              periodo: extracted.periodo || "N/A",
+              base_gravable: extracted.base_gravable !== undefined ? extracted.base_gravable : null,
+              tarifa: extracted.tarifa !== undefined ? extracted.tarifa : null,
+              valor_declarado_por_impuestos:
+                extracted.valor_declarado_por_impuestos !== undefined ? extracted.valor_declarado_por_impuestos : null,
+              intereses_o_sanciones:
+                extracted.intereses_o_sanciones !== undefined ? extracted.intereses_o_sanciones : null,
+              total_a_pagar: extracted.total_a_pagar !== undefined ? extracted.total_a_pagar : null,
+              confianza_extraccion:
+                extracted.confianza_extraccion !== undefined ? extracted.confianza_extraccion : undefined,
+              etiqueta_detectada:
+                extracted.etiqueta_detectada !== undefined ? extracted.etiqueta_detectada : undefined,
+              motivo_revision: extracted.motivo_revision !== undefined ? extracted.motivo_revision : undefined,
+              metodo_usado: extracted.metodo_usado !== undefined ? extracted.metodo_usado : undefined,
+              mi_valor_contabilidad: 0,
+              status: "success",
+              processedAt: new Date().toISOString(),
+            };
 
-        if (response.ok && result.success) {
-          const extracted = result.data;
+            setEntries((prev) => [newEntry, ...prev]);
+            setItem(fileItem.id, { status: "success", progress: 100, extractedData: extracted, stageLabel: undefined });
+            setApiStatus({ kind: "ok", model: modelUsed, keySource: result.keySource });
+            finished = true;
+            continue;
+          }
 
-          const newEntry: TaxEntry = {
-            id: `audit-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
-            fileName: fileItem.name,
-            municipio: extracted.municipio || "Desconocido",
-            tipo_impuesto: (extracted.tipo_impuesto || "DESCONOCIDO").toUpperCase() as any,
-            nit: extracted.nit || "M-N/A",
-            contribuyente: extracted.contribuyente || "Desconocido",
-            periodo: extracted.periodo || "N/A",
-            base_gravable: extracted.base_gravable !== undefined ? extracted.base_gravable : null,
-            tarifa: extracted.tarifa !== undefined ? extracted.tarifa : null,
-            valor_declarado_por_impuestos:
-              extracted.valor_declarado_por_impuestos !== undefined ? extracted.valor_declarado_por_impuestos : null,
-            intereses_o_sanciones:
-              extracted.intereses_o_sanciones !== undefined ? extracted.intereses_o_sanciones : null,
-            total_a_pagar: extracted.total_a_pagar !== undefined ? extracted.total_a_pagar : null,
-            confianza_extraccion:
-              extracted.confianza_extraccion !== undefined ? extracted.confianza_extraccion : undefined,
-            etiqueta_detectada:
-              extracted.etiqueta_detectada !== undefined ? extracted.etiqueta_detectada : undefined,
-            motivo_revision: extracted.motivo_revision !== undefined ? extracted.motivo_revision : undefined,
-            metodo_usado: extracted.metodo_usado !== undefined ? extracted.metodo_usado : undefined,
-            mi_valor_contabilidad: 0,
-            status: "success",
-            processedAt: new Date().toISOString(),
-          };
+          // The server reports the real error type and Google's own message
+          const kind: ApiStatusKind =
+            result.errorKind === "rate_minute" || result.errorKind === "overloaded" || result.errorKind === "quota_daily"
+              ? result.errorKind
+              : "other";
+          const googleMessage: string = result.error || "La extracción por IA falló inesperadamente.";
+          setApiStatus({
+            kind,
+            model: modelUsed,
+            keySource: result.keySource,
+            httpStatus: result.httpStatus,
+            message: googleMessage,
+          });
 
-          setEntries((prev) => [newEntry, ...prev]);
+          if (kind === "quota_daily") {
+            // Retrying cannot help: stop the batch and keep the remaining files pending
+            dailyQuotaHit = true;
+            break;
+          }
 
-          setFileQueue((prev) =>
-            prev.map((item) =>
-              item.id === fileItem.id
-                ? { ...item, status: "success", progress: 100, extractedData: extracted, stageLabel: undefined }
-                : item
-            )
-          );
-        } else {
-          throw new Error(result.error || "La extracción por IA falló inesperadamente.");
+          if ((kind === "rate_minute" || kind === "overloaded") && retries < MAX_RETRIES_PER_FILE) {
+            retries++;
+            const waitSeconds =
+              kind === "rate_minute"
+                ? Math.min((typeof result.retryAfterSeconds === "number" ? result.retryAfterSeconds : 30) + 2, 90)
+                : Math.min(10 * 2 ** (retries - 1), 60);
+            setItem(fileItem.id, {
+              stageLabel:
+                kind === "rate_minute"
+                  ? `Límite por minuto · reintento ${retries}/${MAX_RETRIES_PER_FILE}`
+                  : `Modelo saturado · reintento ${retries}/${MAX_RETRIES_PER_FILE}`,
+            });
+            if (!(await waitWithCountdown(waitSeconds, kind))) break;
+            continue;
+          }
+
+          const prefix =
+            kind === "rate_minute"
+              ? `Límite por minuto de Google (429) tras ${MAX_RETRIES_PER_FILE} reintentos: `
+              : kind === "overloaded"
+              ? `Modelo saturado en Google (503, no es cuota) tras ${MAX_RETRIES_PER_FILE} reintentos: `
+              : result.httpStatus
+              ? `Error ${result.httpStatus} de Gemini: `
+              : "";
+          throw new Error(prefix + googleMessage);
         }
       } catch (err: any) {
-        setFileQueue((prev) =>
-          prev.map((item) =>
-            item.id === fileItem.id
-              ? { ...item, status: "error", progress: 100, errorMsg: err.message, stageLabel: undefined }
-              : item
-          )
-        );
+        setItem(fileItem.id, { status: "error", progress: 100, errorMsg: err.message, stageLabel: undefined });
+        finished = true;
       }
 
+      // Not finished means cancelled or daily quota exhausted: the file stays pending
+      if (!finished) break;
+
       completedCount++;
-      const overallProgress = Math.round((completedCount / totalToProcess) * 100);
-      setBatchProgress(overallProgress);
+      setBatchProgress(Math.round((completedCount / totalToProcess) * 100));
     }
 
-    if (cancelBatchRef.current) {
-      setFileQueue((prev) =>
-        prev.map((item) =>
-          item.status === "processing" ? { ...item, status: "pending", progress: 0, stageLabel: undefined } : item
-        )
+    // Anything left mid-flight goes back to pending so it can be resumed later
+    setFileQueue((prev) =>
+      prev.map((item) =>
+        item.status === "processing" ? { ...item, status: "pending", progress: 0, stageLabel: undefined } : item
+      )
+    );
+
+    if (dailyQuotaHit) {
+      const remaining = totalToProcess - completedCount;
+      setNoticeBanner(
+        `Cuota diaria agotada para ${config.model}. El lote se detuvo y ${remaining} ${
+          remaining === 1 ? "archivo queda pendiente" : "archivos quedan pendientes"
+        } sin modificar. Cambia de modelo en Configuración o espera al reinicio de la cuota y pulsa "Iniciar Auditoría".`
       );
     }
 
-    setCooldownRemaining(0);
+    setWaitState(null);
     setIsProcessingBatch(false);
     setIsCancelling(false);
     cancelBatchRef.current = false;
@@ -514,7 +501,7 @@ export default function App() {
     >
       <header className="px-8 md:px-16 py-8 md:py-12 flex justify-between items-baseline">
         <div className="logo-wrap">
-          <div className="meta-label mb-2">Colombian Tax Audit AI · Hybrid OCR</div>
+          <div className="meta-label mb-2">Colombian Tax Audit AI · Gemini</div>
           <h1 className="text-4xl md:text-5xl font-serif italic font-medium tracking-tight">
             Tax<span className="not-italic font-semibold text-accent">Flow</span>
           </h1>
@@ -577,7 +564,7 @@ export default function App() {
               <Settings className="w-5 h-5 text-accent" />
               Configuración de Extracción e IA
             </h3>
-            <span className="meta-label">Cloud Pipeline</span>
+            <span className="meta-label">Gemini API</span>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
@@ -596,31 +583,6 @@ export default function App() {
               </select>
               <p className="text-xs text-ink-muted mt-2 leading-relaxed">
                 Ejecución 100% en la nube sin necesidad de servidores GPU locales.
-              </p>
-            </div>
-
-            {/* Pipeline Architecture Selection */}
-            <div>
-              <label className="block meta-label mb-2" htmlFor="pipeline-select">
-                Arquitectura OCR
-              </label>
-              <select
-                value={config.pipeline}
-                onChange={(e) =>
-                  setConfig({ ...config, pipeline: e.target.value as ExtractionPipeline })
-                }
-                className="w-full bg-white text-ink border border-ink-faint rounded px-4 py-3 text-sm focus:outline-none focus:border-accent shadow-sm"
-                id="pipeline-select"
-              >
-                <option value="hybrid_markdown_ocr">
-                  Pipeline Híbrido (OCR Markdown + Gemini)
-                </option>
-                <option value="direct_multimodal">
-                  Extracción Directa (1 Pase Rápido)
-                </option>
-              </select>
-              <p className="text-xs text-ink-muted mt-2 leading-relaxed">
-                El <span className="font-mono text-accent">Pipeline Híbrido</span> reconstruye primero la tabla de renglones en Markdown para máxima fidelidad en escaneos.
               </p>
             </div>
 
@@ -645,7 +607,48 @@ export default function App() {
                 <option value="gemini-3.5-flash">gemini-3.5-flash</option>
               </select>
               <p className="text-xs text-ink-muted mt-2 leading-relaxed">
-                Modelo seleccionado: <span className="font-mono text-accent">{config.model}</span> (con reintento automático sobre el modelo elegido).
+                Cada modelo tiene su propia cuota. Si uno agota su cupo diario, cambia a otro aquí.
+              </p>
+            </div>
+
+            {/* API Key */}
+            <div>
+              <label className="block meta-label mb-2" htmlFor="api-key-input">
+                API Key (Opcional)
+              </label>
+              <div className="flex gap-2">
+                <input
+                  type={showApiKey ? "text" : "password"}
+                  value={config.apiKey || ""}
+                  onChange={(e) => setConfig({ ...config, apiKey: e.target.value })}
+                  placeholder="Vacío = clave de AI Studio"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="w-full min-w-0 bg-white text-ink border border-ink-faint rounded px-4 py-3 text-sm font-mono focus:outline-none focus:border-accent shadow-sm"
+                  id="api-key-input"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowApiKey(!showApiKey)}
+                  className="meta-label hover:text-accent transition-colors cursor-pointer bg-transparent shrink-0"
+                >
+                  {showApiKey ? "Ocultar" : "Ver"}
+                </button>
+                {hasCustomKey && (
+                  <button
+                    type="button"
+                    onClick={() => setConfig({ ...config, apiKey: "" })}
+                    className="meta-label text-red-700 hover:underline cursor-pointer bg-transparent shrink-0"
+                    id="btn-clear-api-key"
+                  >
+                    Borrar
+                  </button>
+                )}
+              </div>
+              <p className="text-xs text-ink-muted mt-2 leading-relaxed">
+                {hasCustomKey
+                  ? "Se está usando esta clave, guardada en este navegador. La cuota que aplica es la del proyecto de esta clave."
+                  : "Se está usando la clave que inyecta AI Studio (GEMINI_API_KEY)."}
               </p>
             </div>
           </div>
@@ -653,40 +656,49 @@ export default function App() {
       )}
 
       <main className="px-8 md:px-16 pb-16 max-w-[1600px] mx-auto w-full space-y-6 flex-1">
-        {/* Quota Consumption Counter & Visual Rate-Limit Indicator Bar */}
+        {/* Real API status (as reported by Google) and local request counter */}
         <section
-          aria-label="Monitor de consumo de cuota y tasa de la API"
+          aria-label="Estado de la API y contador de peticiones"
           className={`editorial-card px-6 py-4 border transition-colors ${
-            rateStatus === "at_limit"
+            apiStatus.kind === "quota_daily" || apiStatus.kind === "other"
               ? "border-red-300 bg-red-50/40"
-              : rateStatus === "near_limit"
+              : apiStatus.kind === "rate_minute" || apiStatus.kind === "overloaded"
               ? "border-amber-300 bg-amber-50/40"
               : "border-ink-faint bg-white"
           }`}
         >
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-            {/* Left: Active Model & Real-time Visual Status Indicator */}
             <div className="flex flex-wrap items-center gap-3">
-              {rateStatus === "at_limit" ? (
+              {apiStatus.kind === "quota_daily" ? (
+                <div className="flex items-center gap-2 text-xs font-mono text-red-700">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-red-600" />
+                  <span className="font-bold uppercase tracking-wider">Cuota diaria agotada (429)</span>
+                </div>
+              ) : apiStatus.kind === "rate_minute" ? (
+                <div className="flex items-center gap-2 text-xs font-mono text-amber-800">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+                  <span className="font-bold uppercase tracking-wider">Límite por minuto (429)</span>
+                </div>
+              ) : apiStatus.kind === "overloaded" ? (
+                <div className="flex items-center gap-2 text-xs font-mono text-amber-800">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
+                  <span className="font-bold uppercase tracking-wider">Modelo saturado en Google (503) · No es cuota</span>
+                </div>
+              ) : apiStatus.kind === "other" ? (
                 <div className="flex items-center gap-2 text-xs font-mono text-red-700">
                   <AlertCircle className="w-4 h-4 shrink-0 text-red-600" />
                   <span className="font-bold uppercase tracking-wider">
-                    Límite de Tasa Alcanzado · Enfriamiento Activo
+                    Error de la API{apiStatus.httpStatus ? ` (${apiStatus.httpStatus})` : ""}
                   </span>
                 </div>
-              ) : rateStatus === "near_limit" ? (
-                <div className="flex items-center gap-2 text-xs font-mono text-amber-800">
-                  <AlertCircle className="w-4 h-4 shrink-0 text-amber-600" />
-                  <span className="font-bold uppercase tracking-wider">
-                    Operando Cerca del Límite de Tasa · Ritmo Regulado
-                  </span>
-                </div>
-              ) : (
+              ) : apiStatus.kind === "ok" ? (
                 <div className="flex items-center gap-2 text-xs font-mono text-ink">
                   <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-700" />
-                  <span className="uppercase tracking-wider">
-                    Tasa de API Estable
-                  </span>
+                  <span className="uppercase tracking-wider">Última petición correcta</span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-xs font-mono text-ink-muted">
+                  <span className="uppercase tracking-wider">Sin peticiones en esta sesión</span>
                 </div>
               )}
 
@@ -694,100 +706,58 @@ export default function App() {
                 ·
               </span>
               <span className="meta-label">
-                Motor Exclusivo: <strong className="text-ink">{config.model}</strong>
+                Modelo: <strong className="text-ink">{config.model}</strong>
+              </span>
+              <span className="text-ink-muted text-xs" aria-hidden="true">
+                ·
+              </span>
+              <span className="meta-label">
+                Clave: <strong className="text-ink">{hasCustomKey ? "propia (este navegador)" : "AI Studio"}</strong>
               </span>
             </div>
 
-            {/* Right: RPM (60s Sliding Window) & Daily Estimated Consumption Counters */}
-            <div className="flex flex-wrap items-center gap-6">
-              {/* RPM Rate Meter (Last 60 seconds) */}
-              <div className="flex items-center gap-3 min-w-[210px]">
-                <div className="flex-1 space-y-1">
-                  <div className="flex items-center justify-between text-[11px] font-mono">
-                    <span className="text-ink-muted uppercase tracking-wider">Tasa (60s)</span>
-                    <span
-                      className={`font-bold tabular-nums ${
-                        rateStatus === "at_limit"
-                          ? "text-red-700"
-                          : rateStatus === "near_limit"
-                          ? "text-amber-800"
-                          : "text-ink"
-                      }`}
-                    >
-                      {currentRpm} / {quotaTracker.rpmSafeLimit} req/min
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full bg-ink-faint overflow-hidden">
-                    <div
-                      className={`h-full transition-all duration-300 ${
-                        rateStatus === "at_limit"
-                          ? "bg-red-600"
-                          : rateStatus === "near_limit"
-                          ? "bg-amber-500"
-                          : "bg-emerald-700"
-                      }`}
-                      style={{ width: `${Math.min(100, Math.round(rpmRatio * 100))}%` }}
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Daily Quota Counter (Estimated RPD) */}
-              <div className="flex items-center gap-3 min-w-[230px]">
-                <div className="flex-1 space-y-1">
-                  <div className="flex items-center justify-between text-[11px] font-mono">
-                    <span className="text-ink-muted uppercase tracking-wider">Cuota Hoy</span>
-                    <span className="font-bold text-ink tabular-nums">
-                      {quotaTracker.dailyRequests} / {quotaTracker.dailyLimit} peticiones ({Math.min(100, Math.round(dailyRatio * 100))}%)
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full bg-ink-faint overflow-hidden">
-                    <div
-                      className={`h-full transition-all duration-300 ${
-                        dailyRatio >= 0.9
-                          ? "bg-red-600"
-                          : dailyRatio >= 0.75
-                          ? "bg-amber-500"
-                          : "bg-accent"
-                      }`}
-                      style={{ width: `${Math.min(100, Math.round(dailyRatio * 100))}%` }}
-                    />
-                  </div>
-                </div>
-
-                {quotaTracker.dailyRequests > 0 && (
-                  <button
-                    onClick={resetQuotaCounter}
-                    title="Reiniciar contador de peticiones estimado"
-                    className="meta-label hover:text-ink transition-colors cursor-pointer bg-transparent p-1"
-                    id="btn-reset-quota-counter"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                  </button>
-                )}
-              </div>
+            <div className="flex items-center gap-3">
+              <span
+                className="text-[11px] font-mono text-ink-muted uppercase tracking-wider"
+                title="Conteo local de este navegador. La cuota real se consulta en el panel de uso de Google AI Studio."
+              >
+                Peticiones enviadas hoy:{" "}
+                <strong className="text-ink tabular-nums">{requestsTodayForModel}</strong>
+              </span>
+              {requestsTodayForModel > 0 && (
+                <button
+                  onClick={resetRequestCounter}
+                  title="Reiniciar contador local de peticiones"
+                  className="meta-label hover:text-ink transition-colors cursor-pointer bg-transparent p-1"
+                  id="btn-reset-quota-counter"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
           </div>
 
-          {/* Contextual Warning Detail when operating near or at rate limits */}
-          {rateStatus !== "optimal" && (
+          {/* Google's own error message plus what to do about it */}
+          {apiStatus.message && apiStatus.kind !== "ok" && apiStatus.kind !== "idle" && (
             <div
-              className={`mt-3 pt-2.5 border-t text-xs flex items-center justify-between ${
-                rateStatus === "at_limit"
+              className={`mt-3 pt-2.5 border-t text-xs space-y-1.5 ${
+                apiStatus.kind === "quota_daily" || apiStatus.kind === "other"
                   ? "border-red-200 text-red-800"
                   : "border-amber-200 text-amber-900"
               }`}
             >
-              <span>
-                {rateStatus === "at_limit"
-                  ? "Se alcanzó el umbral de peticiones por minuto de la API. El servidor aplica espera automática y reintenta en gemini-3.1-flash-lite sin perder archivos."
-                  : `Operando al ${Math.round(Math.max(rpmRatio, dailyRatio) * 100)}% del umbral seguro de tasa (${currentRpm} req/min). El intervalo preventivo de 12s entre documentos mantiene estable la cuota.`}
-              </span>
-              {cooldownRemaining > 0 && (
-                <span className="font-mono font-bold tabular-nums shrink-0 ml-4">
-                  Enfriando: {cooldownRemaining}s
-                </span>
-              )}
+              <p>
+                {apiStatus.kind === "quota_daily"
+                  ? `El proyecto de la clave en uso agotó la cuota diaria de ${apiStatus.model}. Reintentar no sirve: cambia de modelo o espera al reinicio diario de Google.`
+                  : apiStatus.kind === "rate_minute"
+                  ? "Google pidió esperar antes de la siguiente petición. La app espera ese tiempo y reintenta el mismo archivo."
+                  : apiStatus.kind === "overloaded"
+                  ? "Google no pudo atender la petición por alta demanda del modelo. Tu cuota no se ve afectada; la app reintenta tras una pausa."
+                  : "La petición falló por un motivo distinto a la cuota. Revisa el mensaje de Google."}
+              </p>
+              <p className="font-mono text-[11px] break-words whitespace-pre-wrap opacity-90">
+                Mensaje de Google: {apiStatus.message}
+              </p>
             </div>
           )}
         </section>
@@ -812,9 +782,7 @@ export default function App() {
             {/* Progress Bar */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs">
-                <span className="meta-label">
-                  Progreso · {config.pipeline === "hybrid_markdown_ocr" ? "Modo Híbrido (OCR Markdown + Auditoría)" : "Modo Directo"}
-                </span>
+                <span className="meta-label">Progreso del lote</span>
                 <span className="font-mono font-bold text-accent tabular-nums">{batchProgress}%</span>
               </div>
               <div className="h-1.5 w-full bg-ink-faint overflow-hidden">
@@ -825,11 +793,15 @@ export default function App() {
               </div>
             </div>
 
-            {cooldownRemaining > 0 && (
+            {waitState && (
               <div className="p-3 bg-amber-50 text-amber-900 border border-amber-200 text-[11px] flex items-center justify-center gap-2">
                 <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 text-amber-600" />
                 <span>
-                  Regulación de Tasa ({config.model}): Pausa preventiva de {cooldownRemaining}s antes de la siguiente petición...
+                  {waitState.reason === "pacing"
+                    ? `Pausa preventiva entre documentos: ${waitState.seconds}s`
+                    : waitState.reason === "rate_minute"
+                    ? `Google pidió esperar por el límite por minuto. Reintentando en ${waitState.seconds}s`
+                    : `Modelo saturado en Google. Reintentando en ${waitState.seconds}s`}
                 </span>
               </div>
             )}
@@ -853,7 +825,7 @@ export default function App() {
                   <>
                     <div className="py-2.5 px-5 text-xs font-bold uppercase tracking-widest bg-ink-faint text-ink flex items-center gap-2 whitespace-nowrap shrink-0">
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      Procesando Pipeline...
+                      Procesando...
                     </div>
                     <button
                       onClick={cancelBatchProcessing}
@@ -1116,7 +1088,7 @@ export default function App() {
       <footer className="border-t border-ink-faint py-12 px-8 md:px-16 flex flex-col md:flex-row justify-between items-center gap-4 text-center md:text-left bg-[#fdfcf9]">
         <div className="meta-label">Gestión Tributaria Inteligente</div>
         <div className="meta-label text-ink-muted text-right">
-          PIPELINE HÍBRIDO OCR MARKDOWN + GEMINI
+          LECTURA NATIVA DE PDF CON GEMINI
           <br />© 2026
         </div>
       </footer>
