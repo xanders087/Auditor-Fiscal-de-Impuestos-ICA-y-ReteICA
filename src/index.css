@@ -1,0 +1,60 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=Inter:wght@300;400;500&family=Space+Mono&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Cormorant Garamond", serif;
+  --font-mono: "Space Mono", monospace;
+  
+  --color-bg: #fdfcf9;
+  --color-ink: #1a1a1a;
+  --color-accent: #d4a373;
+  --color-ink-faint: rgba(26, 26, 26, 0.05);
+  --color-ink-muted: rgba(26, 26, 26, 0.5);
+}
+
+@layer base {
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    overflow-x: hidden;
+  }
+
+  /* Custom classes for the new design */
+  .editorial-card {
+    background: white;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.03);
+    border-radius: 4px;
+  }
+
+  .meta-label {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    color: var(--color-ink-muted);
+  }
+
+  /* Custom scrollbar for refined feel */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-bg);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-ink-faint);
+    border-radius: 0;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-accent);
+  }
+}
+
+::selection {
+  background: var(--color-accent);
+  color: white;
+}
+

@@ -1,0 +1,6 @@
+{
+  "summary":  "Plan de implementación para habilitar gemini-2.5-flash, gemini-3.1-flash-lite y gemini-3.5-flash, restaurar el campo de API Key en el panel de Configuración y restablecer la lógica original de control de cuota y reintentos en el servidor.",
+  "updatedAt":  "2026-11-10T22:48:09.276300050Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

@@ -1,0 +1,8 @@
+{
+  "name": "Remix Auditor Fiscal de Impuestos ICA y ReteICA",
+  "description": "Aplicación premium de gestión y auditoría tributaria colombiana (ICA y ReteICA) con extracción inteligente automatizada mediante IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
